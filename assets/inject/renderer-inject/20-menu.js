@@ -182,20 +182,30 @@
         throw failure.error;
       }
       const promise = Promise.resolve().then(async () => {
+        // 旧产物仍按文件名前缀命中。前缀不存在时才读 Rspack 已执行模块，
+        // 不能把数字哈希文件名写死进这里。
         const url = codexAppAssetUrl(namePart) || await codexAppAssetUrlFromScriptText(namePart);
-        if (!url) throw codexAppAssetMissingError(namePart);
-        return await import(url);
+        if (url) return await import(url);
+        if (typeof codexRspackSemanticNamespace === "function") {
+          const semantic = await codexRspackSemanticNamespace(namePart);
+          if (semantic) return semantic;
+        }
+        throw codexAppAssetMissingError(namePart);
       }).then((module) => {
         // Codex 更新后 asset 可能又出现，成功时把失败记录清掉，冷却计数重新开始。
         codexAppModuleFailures.delete(namePart);
         return module;
       }).catch((error) => {
         codexServiceTierModulePromises.delete(namePart);
-        codexAppModuleFailures.set(namePart, {
-          at: Date.now(),
-          attempts: (codexAppModuleFailures.get(namePart)?.attempts || 0) + 1,
-          error,
-        });
+        // 运行时已在、目标模块还没执行：这是内存缓存未就绪，不是「asset 不存在」。
+        // 不计入 8 次失败上限，否则启动早期会把整层补丁永久熔断。
+        if (error?.code !== "CODEX_PLUS_RSPACK_PENDING") {
+          codexAppModuleFailures.set(namePart, {
+            at: Date.now(),
+            attempts: (codexAppModuleFailures.get(namePart)?.attempts || 0) + 1,
+            error,
+          });
+        }
         throw error;
       });
       codexServiceTierModulePromises.set(namePart, promise);
@@ -209,10 +219,355 @@
     } catch (error) {
       // 结构化标记优先；保留字符串兜底以便老缓存里的 Error 也能被认出来。
       if (isCodexAppAssetMissingError(error)) return null;
+      if (error?.code === "CODEX_PLUS_RSPACK_PENDING") return null;
       if (String(error?.message || error).includes(`未找到 Codex App asset: ${namePart}`)) return null;
       throw error;
     }
   }
+
+  // Codex 26.1103 起桌面端用 Rspack 打出 /assets/<数字>.<哈希>.js，不再有
+  // setting-storage- / app-initial- / app-shared- 这类文件名。哈希每次构建都变，
+  // 不能写死。只 import 页面上已经执行过的入口脚本，读 __webpack_require__.c
+  // 里已经求值的导出；不执行未加载工厂，也不按哈希表把全部分块 fetch 一遍。
+  const codexRspackSemanticPrefixes = [
+    "setting-storage-",
+    "vscode-api-",
+    "app-initial-",
+    "app-shared-",
+    "use-host-config-",
+    "app-server-manager-signals-",
+  ];
+  let codexRspackRequireTask = null;
+  let codexRspackRequireRuntime = null;
+  let codexRspackExportCache = { size: -1, at: 0, values: [] };
+
+  function codexRspackKnownPrefix(namePart) {
+    return codexRspackSemanticPrefixes.includes(namePart);
+  }
+
+  function codexRspackEntryUrls() {
+    const urls = [];
+    const seen = new Set();
+    for (const script of Array.from(document?.scripts || [])) {
+      const url = typeof script?.src === "string" ? script.src : "";
+      const path = url.split("?")[0];
+      if (!path.includes("/assets/") || !path.endsWith(".js")) continue;
+      if (!/\/(?:index-[\w.-]+|\d+\.[a-f\d]+)\.js$/.test(path)) continue;
+      if (seen.has(url)) continue;
+      seen.add(url);
+      urls.push(url);
+    }
+    return urls.slice(0, 4);
+  }
+
+  function codexFunctionSource(fn) {
+    if (typeof fn !== "function") return "";
+    try {
+      return Function.prototype.toString.call(fn);
+    } catch {
+      return "";
+    }
+  }
+
+  function codexRspackModuleCount() {
+    if (!codexRspackRequireRuntime?.c) return 0;
+    try {
+      return Object.keys(codexRspackRequireRuntime.c).length;
+    } catch {
+      return 0;
+    }
+  }
+
+  async function codexImportRspackEntry(url) {
+    const hook = window.__codexPlusImportRspackEntry;
+    if (typeof hook === "function") return hook(url);
+    return await import(url);
+  }
+
+  async function codexRspackRequire() {
+    if (codexRspackRequireRuntime) return codexRspackRequireRuntime;
+    if (codexRspackRequireTask) return codexRspackRequireTask;
+    codexRspackRequireTask = (async () => {
+      for (const url of codexRspackEntryUrls()) {
+        try {
+          const namespace = await codexImportRspackEntry(url);
+          const runtime = namespace?.__webpack_require__;
+          if (runtime && typeof runtime.m === "object" && runtime.m && typeof runtime.c === "object" && runtime.c) {
+            codexRspackRequireRuntime = runtime;
+            return runtime;
+          }
+        } catch {
+          // 某个入口不是 Rspack runtime 时继续看下一个，不把失败当成整页不可用。
+        }
+      }
+      return null;
+    })().finally(() => {
+      codexRspackRequireTask = null;
+    });
+    return codexRspackRequireTask;
+  }
+
+  function codexRspackPushExport(value, seen, out) {
+    if (value == null || (typeof value !== "object" && typeof value !== "function")) return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    out.push(value);
+  }
+
+  function codexRspackCollectExportValues(runtime) {
+    const out = [];
+    const seen = new Set();
+    const cache = runtime?.c;
+    if (!cache || typeof cache !== "object") return out;
+    let entries = [];
+    try {
+      entries = Object.entries(cache);
+    } catch {
+      return out;
+    }
+    for (const [, cached] of entries) {
+      let exports;
+      try {
+        exports = cached?.exports;
+      } catch {
+        continue;
+      }
+      codexRspackPushExport(exports, seen, out);
+      if (!exports || (typeof exports !== "object" && typeof exports !== "function")) continue;
+      const nested = [];
+      try {
+        if (exports.default && exports.default !== exports) nested.push(exports.default);
+      } catch {
+        // default 是 RPC stub 时跳过。
+      }
+      let keys = [];
+      try {
+        keys = Object.keys(exports);
+      } catch {
+        keys = [];
+      }
+      for (const key of keys) {
+        try {
+          nested.push(exports[key]);
+        } catch {
+          // 26.908 起的 RPC stub 被读属性时会抛，不能中断整次扫描。
+        }
+      }
+      for (const value of nested) {
+        codexRspackPushExport(value, seen, out);
+        if (!value || typeof value !== "object" || typeof value === "function") continue;
+        let childKeys = [];
+        try {
+          childKeys = Object.keys(value);
+        } catch {
+          continue;
+        }
+        for (const key of childKeys) {
+          try {
+            codexRspackPushExport(value[key], seen, out);
+          } catch {
+            // 同上，stub 抛错就跳过这一项。
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  function codexRspackExportValues(runtime) {
+    const size = (() => {
+      try {
+        return runtime?.c ? Object.keys(runtime.c).length : 0;
+      } catch {
+        return 0;
+      }
+    })();
+    const now = Date.now();
+    if (codexRspackExportCache.size === size && now - codexRspackExportCache.at < 1000) {
+      return codexRspackExportCache.values;
+    }
+    const values = codexRspackCollectExportValues(runtime);
+    codexRspackExportCache = { size, at: now, values };
+    return values;
+  }
+
+  function codexRspackSettingFns(values) {
+    const getSetting = values.find((candidate) => {
+      const source = codexFunctionSource(candidate);
+      return source.includes("get-setting") && source.includes("params") && source.includes("key");
+    });
+    const setSetting = values.find((candidate) => {
+      const source = codexFunctionSource(candidate);
+      return source.includes("set-setting") && source.includes("params") && source.includes("key");
+    });
+    return typeof getSetting === "function" && typeof setSetting === "function"
+      ? { n: getSetting, s: setSetting }
+      : null;
+  }
+
+  function codexRspackStateCall(values) {
+    return values.find((candidate) => {
+      const source = codexFunctionSource(candidate);
+      return source.includes("get-global-state")
+        && source.includes("set-global-state")
+        && source.includes("params");
+    }) || null;
+  }
+
+  function codexRspackHostServices(values) {
+    for (const candidate of values) {
+      if (!candidate || typeof candidate !== "object" || typeof candidate === "function") continue;
+      try {
+        const own = (key) => Object.prototype.hasOwnProperty.call(candidate, key);
+        if (!own("settings") || !own("applicationState")) continue;
+        const settings = candidate.settings;
+        if (settings && typeof settings.write === "function" && typeof settings.readAll === "function") return candidate;
+      } catch {
+        // stub 抛错时换下一个导出。
+      }
+    }
+    return null;
+  }
+
+  function codexRspackDispatcher(values) {
+    const singleton = values.find((candidate) => candidate
+      && typeof candidate === "object"
+      && typeof candidate.dispatchMessage === "function"
+      && typeof candidate.subscribe === "function");
+    if (singleton) return singleton;
+    const dispatcherClass = values.find((candidate) => typeof candidate === "function"
+      && typeof candidate.getInstance === "function"
+      && typeof candidate.prototype?.dispatchMessage === "function");
+    try {
+      return dispatcherClass?.getInstance?.() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function codexAppServerClientShapeMatches(ctor) {
+    if (typeof ctor !== "function" || typeof ctor.prototype?.sendRequest !== "function") return false;
+    const source = codexFunctionSource(ctor);
+    const method = codexFunctionSource(ctor.prototype.sendRequest);
+    if (source.includes(codexAppServerClientCaptureMarker) || method.includes(codexAppServerClientCaptureMarker)) return true;
+    return method.includes("enqueueRequest") && method.includes("dispatchMessage");
+  }
+
+  function codexRspackAppServerClients(values) {
+    const classes = [];
+    const clients = [];
+    for (const value of values) {
+      if (typeof value === "function" && codexAppServerClientShapeMatches(value)) {
+        classes.push(value);
+        continue;
+      }
+      if (!value || typeof value.sendRequest !== "function") continue;
+      if (codexAppServerClientShapeMatches(value.constructor)) clients.push(value);
+    }
+    return { classes, clients };
+  }
+
+  function codexRspackSemanticExports(namePart, values) {
+    const settings = codexRspackSettingFns(values);
+    const state = codexRspackStateCall(values);
+    const dispatcher = codexRspackDispatcher(values);
+    const host = codexRspackHostServices(values);
+    const { clients } = codexRspackAppServerClients(values);
+    if (namePart === "setting-storage-") return settings;
+    if (namePart === "vscode-api-") return typeof state === "function" ? { n: state } : null;
+    if (namePart === "use-host-config-" || namePart === "app-server-manager-signals-") {
+      if (!clients.length) return null;
+      const out = {};
+      clients.forEach((client, index) => {
+        out[`client${index}`] = client;
+      });
+      return out;
+    }
+    if (namePart === "app-initial-" || namePart === "app-shared-") {
+      const out = {};
+      if (settings) {
+        out.n = settings.n;
+        out.s = settings.s;
+        out.jut = settings.n;
+        out.Put = settings.s;
+      }
+      if (typeof state === "function") out.qut = state;
+      if (dispatcher) out.dispatcher = dispatcher;
+      if (host) out.hostServices = host;
+      clients.forEach((client, index) => {
+        out[`client${index}`] = client;
+      });
+      return Object.keys(out).length ? out : null;
+    }
+    return null;
+  }
+
+  function codexRspackLiveNamespace(runtime, namePart) {
+    const current = () => codexRspackSemanticExports(namePart, codexRspackExportValues(runtime)) || {};
+    return new Proxy({}, {
+      get(_target, prop) {
+        if (prop === "__codexPlusAssetDiscovery") return "rspack-module-cache";
+        if (prop === "then") return undefined;
+        return current()[prop];
+      },
+      ownKeys() {
+        return Object.keys(current());
+      },
+      getOwnPropertyDescriptor(_target, prop) {
+        if (typeof prop !== "string") return undefined;
+        const exports = current();
+        if (!Object.prototype.hasOwnProperty.call(exports, prop)) return undefined;
+        return { configurable: true, enumerable: true, writable: true, value: exports[prop] };
+      },
+    });
+  }
+
+  function codexRspackPending(namePart) {
+    const error = new Error(`Codex rspack module pending: ${namePart}`);
+    error.code = "CODEX_PLUS_RSPACK_PENDING";
+    return error;
+  }
+
+  async function codexRspackSemanticNamespace(namePart) {
+    if (!codexRspackKnownPrefix(namePart)) return null;
+    const runtime = await codexRspackRequire();
+    if (!runtime) return null;
+    const exports = codexRspackSemanticExports(namePart, codexRspackExportValues(runtime));
+    if (!exports) throw codexRspackPending(namePart);
+    return codexRspackLiveNamespace(runtime, namePart);
+  }
+
+  async function loadRspackAppServerRequestModule() {
+    const runtime = await codexRspackRequire();
+    if (!runtime) return null;
+    const { clients } = codexRspackAppServerClients(codexRspackExportValues(runtime));
+    if (!clients.length) return null;
+    const synthetic = { __codexPlusAssetDiscovery: "rspack-module-cache" };
+    clients.forEach((client, index) => {
+      synthetic[`client${index}`] = client;
+    });
+    return synthetic;
+  }
+
+  async function codexRspackCaptureAppServerClientClass() {
+    const runtime = await codexRspackRequire();
+    if (!runtime) return null;
+    const found = codexRspackAppServerClients(codexRspackExportValues(runtime));
+    if (found.classes.length) {
+      const ctor = found.classes[0];
+      const via = codexFunctionSource(ctor).includes(codexAppServerClientCaptureMarker)
+        ? "rspack-export"
+        : "rspack-shape";
+      return { ctor, via };
+    }
+    if (found.clients.length) {
+      const ctor = found.clients[0]?.constructor;
+      return typeof ctor === "function" ? { ctor, via: "rspack-instance" } : null;
+    }
+    return null;
+  }
+
+  window.__codexPlusRspackCaptureAppServerClientClass = () => codexRspackCaptureAppServerClientClass();
 
   function appServerFallbackAssetUrls() {
     const urls = codexAppAssetCandidateUrls();
@@ -243,16 +598,21 @@
       seen.add(value);
       candidates.push(value);
     };
+    // 哈希分块里找到的是已经在跑的客户端。再调 .get() 会碰到 RPC stub，
+    // 旧的具名模块才需要把容器 .get("local") 展开。
+    const skipNestedGet = module?.__codexPlusAssetDiscovery === "rspack-module-cache";
     for (const value of Object.values(module || {})) {
       push(value);
       if (!value || typeof value !== "object") continue;
-      if (typeof value.get === "function") {
+      if (!skipNestedGet && typeof value.get === "function") {
         try { push(value.get()); } catch {}
         try { push(value.get("local")); } catch {}
       }
-      try {
-        for (const nested of Object.values(value).slice(0, 100)) push(nested);
-      } catch {}
+      if (!skipNestedGet) {
+        try {
+          for (const nested of Object.values(value).slice(0, 100)) push(nested);
+        } catch {}
+      }
     }
     return candidates;
   }
@@ -283,6 +643,12 @@
       } catch {
       }
     }
+    try {
+      const rspackModule = await loadRspackAppServerRequestModule();
+      if (rspackModule) pushModule(rspackModule, "rspack-module-cache");
+    } catch {
+      // 没有 Rspack runtime 时保持原来的具名前缀路径。
+    }
     return { modules, sources };
   }
 
@@ -297,8 +663,10 @@
         candidates.push(candidate);
       }
     }
-    const usedFallback = sources.some((source) => !source.endsWith("-"));
-    return { modules, candidates, sources, discovery: usedFallback ? "fallback" : "named-assets" };
+    const discovery = sources.includes("rspack-module-cache")
+      ? "rspack-module-cache"
+      : (sources.some((source) => !String(source).endsWith("-")) ? "fallback" : "named-assets");
+    return { modules, candidates, sources, discovery };
   }
 
   function codexSettingStorageFromModule(module, assetPrefix = "") {

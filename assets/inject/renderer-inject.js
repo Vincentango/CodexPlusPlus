@@ -432,7 +432,7 @@
   const codexPlusSettingsKey = "codexPlusSettings";
   const codexThreadScrollKey = "codexThreadScroll";
   const codexServiceTierRequestOverrideVersion = "10";
-  const codexAppServerModelRequestPatchVersion = "37";
+  const codexAppServerModelRequestPatchVersion = "38";
   const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
   const codexAppServerClientCaptureAnchor = "async sendRequest(";
   const codexRemoteSessionRecoveryVersion = "8";
@@ -3691,20 +3691,30 @@
         throw failure.error;
       }
       const promise = Promise.resolve().then(async () => {
+        // 旧产物仍按文件名前缀命中。前缀不存在时才读 Rspack 已执行模块，
+        // 不能把数字哈希文件名写死进这里。
         const url = codexAppAssetUrl(namePart) || await codexAppAssetUrlFromScriptText(namePart);
-        if (!url) throw codexAppAssetMissingError(namePart);
-        return await import(url);
+        if (url) return await import(url);
+        if (typeof codexRspackSemanticNamespace === "function") {
+          const semantic = await codexRspackSemanticNamespace(namePart);
+          if (semantic) return semantic;
+        }
+        throw codexAppAssetMissingError(namePart);
       }).then((module) => {
         // Codex 更新后 asset 可能又出现，成功时把失败记录清掉，冷却计数重新开始。
         codexAppModuleFailures.delete(namePart);
         return module;
       }).catch((error) => {
         codexServiceTierModulePromises.delete(namePart);
-        codexAppModuleFailures.set(namePart, {
-          at: Date.now(),
-          attempts: (codexAppModuleFailures.get(namePart)?.attempts || 0) + 1,
-          error,
-        });
+        // 运行时已在、目标模块还没执行：这是内存缓存未就绪，不是「asset 不存在」。
+        // 不计入 8 次失败上限，否则启动早期会把整层补丁永久熔断。
+        if (error?.code !== "CODEX_PLUS_RSPACK_PENDING") {
+          codexAppModuleFailures.set(namePart, {
+            at: Date.now(),
+            attempts: (codexAppModuleFailures.get(namePart)?.attempts || 0) + 1,
+            error,
+          });
+        }
         throw error;
       });
       codexServiceTierModulePromises.set(namePart, promise);
@@ -3718,10 +3728,355 @@
     } catch (error) {
       // 结构化标记优先；保留字符串兜底以便老缓存里的 Error 也能被认出来。
       if (isCodexAppAssetMissingError(error)) return null;
+      if (error?.code === "CODEX_PLUS_RSPACK_PENDING") return null;
       if (String(error?.message || error).includes(`未找到 Codex App asset: ${namePart}`)) return null;
       throw error;
     }
   }
+
+  // Codex 26.1103 起桌面端用 Rspack 打出 /assets/<数字>.<哈希>.js，不再有
+  // setting-storage- / app-initial- / app-shared- 这类文件名。哈希每次构建都变，
+  // 不能写死。只 import 页面上已经执行过的入口脚本，读 __webpack_require__.c
+  // 里已经求值的导出；不执行未加载工厂，也不按哈希表把全部分块 fetch 一遍。
+  const codexRspackSemanticPrefixes = [
+    "setting-storage-",
+    "vscode-api-",
+    "app-initial-",
+    "app-shared-",
+    "use-host-config-",
+    "app-server-manager-signals-",
+  ];
+  let codexRspackRequireTask = null;
+  let codexRspackRequireRuntime = null;
+  let codexRspackExportCache = { size: -1, at: 0, values: [] };
+
+  function codexRspackKnownPrefix(namePart) {
+    return codexRspackSemanticPrefixes.includes(namePart);
+  }
+
+  function codexRspackEntryUrls() {
+    const urls = [];
+    const seen = new Set();
+    for (const script of Array.from(document?.scripts || [])) {
+      const url = typeof script?.src === "string" ? script.src : "";
+      const path = url.split("?")[0];
+      if (!path.includes("/assets/") || !path.endsWith(".js")) continue;
+      if (!/\/(?:index-[\w.-]+|\d+\.[a-f\d]+)\.js$/.test(path)) continue;
+      if (seen.has(url)) continue;
+      seen.add(url);
+      urls.push(url);
+    }
+    return urls.slice(0, 4);
+  }
+
+  function codexFunctionSource(fn) {
+    if (typeof fn !== "function") return "";
+    try {
+      return Function.prototype.toString.call(fn);
+    } catch {
+      return "";
+    }
+  }
+
+  function codexRspackModuleCount() {
+    if (!codexRspackRequireRuntime?.c) return 0;
+    try {
+      return Object.keys(codexRspackRequireRuntime.c).length;
+    } catch {
+      return 0;
+    }
+  }
+
+  async function codexImportRspackEntry(url) {
+    const hook = window.__codexPlusImportRspackEntry;
+    if (typeof hook === "function") return hook(url);
+    return await import(url);
+  }
+
+  async function codexRspackRequire() {
+    if (codexRspackRequireRuntime) return codexRspackRequireRuntime;
+    if (codexRspackRequireTask) return codexRspackRequireTask;
+    codexRspackRequireTask = (async () => {
+      for (const url of codexRspackEntryUrls()) {
+        try {
+          const namespace = await codexImportRspackEntry(url);
+          const runtime = namespace?.__webpack_require__;
+          if (runtime && typeof runtime.m === "object" && runtime.m && typeof runtime.c === "object" && runtime.c) {
+            codexRspackRequireRuntime = runtime;
+            return runtime;
+          }
+        } catch {
+          // 某个入口不是 Rspack runtime 时继续看下一个，不把失败当成整页不可用。
+        }
+      }
+      return null;
+    })().finally(() => {
+      codexRspackRequireTask = null;
+    });
+    return codexRspackRequireTask;
+  }
+
+  function codexRspackPushExport(value, seen, out) {
+    if (value == null || (typeof value !== "object" && typeof value !== "function")) return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    out.push(value);
+  }
+
+  function codexRspackCollectExportValues(runtime) {
+    const out = [];
+    const seen = new Set();
+    const cache = runtime?.c;
+    if (!cache || typeof cache !== "object") return out;
+    let entries = [];
+    try {
+      entries = Object.entries(cache);
+    } catch {
+      return out;
+    }
+    for (const [, cached] of entries) {
+      let exports;
+      try {
+        exports = cached?.exports;
+      } catch {
+        continue;
+      }
+      codexRspackPushExport(exports, seen, out);
+      if (!exports || (typeof exports !== "object" && typeof exports !== "function")) continue;
+      const nested = [];
+      try {
+        if (exports.default && exports.default !== exports) nested.push(exports.default);
+      } catch {
+        // default 是 RPC stub 时跳过。
+      }
+      let keys = [];
+      try {
+        keys = Object.keys(exports);
+      } catch {
+        keys = [];
+      }
+      for (const key of keys) {
+        try {
+          nested.push(exports[key]);
+        } catch {
+          // 26.908 起的 RPC stub 被读属性时会抛，不能中断整次扫描。
+        }
+      }
+      for (const value of nested) {
+        codexRspackPushExport(value, seen, out);
+        if (!value || typeof value !== "object" || typeof value === "function") continue;
+        let childKeys = [];
+        try {
+          childKeys = Object.keys(value);
+        } catch {
+          continue;
+        }
+        for (const key of childKeys) {
+          try {
+            codexRspackPushExport(value[key], seen, out);
+          } catch {
+            // 同上，stub 抛错就跳过这一项。
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  function codexRspackExportValues(runtime) {
+    const size = (() => {
+      try {
+        return runtime?.c ? Object.keys(runtime.c).length : 0;
+      } catch {
+        return 0;
+      }
+    })();
+    const now = Date.now();
+    if (codexRspackExportCache.size === size && now - codexRspackExportCache.at < 1000) {
+      return codexRspackExportCache.values;
+    }
+    const values = codexRspackCollectExportValues(runtime);
+    codexRspackExportCache = { size, at: now, values };
+    return values;
+  }
+
+  function codexRspackSettingFns(values) {
+    const getSetting = values.find((candidate) => {
+      const source = codexFunctionSource(candidate);
+      return source.includes("get-setting") && source.includes("params") && source.includes("key");
+    });
+    const setSetting = values.find((candidate) => {
+      const source = codexFunctionSource(candidate);
+      return source.includes("set-setting") && source.includes("params") && source.includes("key");
+    });
+    return typeof getSetting === "function" && typeof setSetting === "function"
+      ? { n: getSetting, s: setSetting }
+      : null;
+  }
+
+  function codexRspackStateCall(values) {
+    return values.find((candidate) => {
+      const source = codexFunctionSource(candidate);
+      return source.includes("get-global-state")
+        && source.includes("set-global-state")
+        && source.includes("params");
+    }) || null;
+  }
+
+  function codexRspackHostServices(values) {
+    for (const candidate of values) {
+      if (!candidate || typeof candidate !== "object" || typeof candidate === "function") continue;
+      try {
+        const own = (key) => Object.prototype.hasOwnProperty.call(candidate, key);
+        if (!own("settings") || !own("applicationState")) continue;
+        const settings = candidate.settings;
+        if (settings && typeof settings.write === "function" && typeof settings.readAll === "function") return candidate;
+      } catch {
+        // stub 抛错时换下一个导出。
+      }
+    }
+    return null;
+  }
+
+  function codexRspackDispatcher(values) {
+    const singleton = values.find((candidate) => candidate
+      && typeof candidate === "object"
+      && typeof candidate.dispatchMessage === "function"
+      && typeof candidate.subscribe === "function");
+    if (singleton) return singleton;
+    const dispatcherClass = values.find((candidate) => typeof candidate === "function"
+      && typeof candidate.getInstance === "function"
+      && typeof candidate.prototype?.dispatchMessage === "function");
+    try {
+      return dispatcherClass?.getInstance?.() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function codexAppServerClientShapeMatches(ctor) {
+    if (typeof ctor !== "function" || typeof ctor.prototype?.sendRequest !== "function") return false;
+    const source = codexFunctionSource(ctor);
+    const method = codexFunctionSource(ctor.prototype.sendRequest);
+    if (source.includes(codexAppServerClientCaptureMarker) || method.includes(codexAppServerClientCaptureMarker)) return true;
+    return method.includes("enqueueRequest") && method.includes("dispatchMessage");
+  }
+
+  function codexRspackAppServerClients(values) {
+    const classes = [];
+    const clients = [];
+    for (const value of values) {
+      if (typeof value === "function" && codexAppServerClientShapeMatches(value)) {
+        classes.push(value);
+        continue;
+      }
+      if (!value || typeof value.sendRequest !== "function") continue;
+      if (codexAppServerClientShapeMatches(value.constructor)) clients.push(value);
+    }
+    return { classes, clients };
+  }
+
+  function codexRspackSemanticExports(namePart, values) {
+    const settings = codexRspackSettingFns(values);
+    const state = codexRspackStateCall(values);
+    const dispatcher = codexRspackDispatcher(values);
+    const host = codexRspackHostServices(values);
+    const { clients } = codexRspackAppServerClients(values);
+    if (namePart === "setting-storage-") return settings;
+    if (namePart === "vscode-api-") return typeof state === "function" ? { n: state } : null;
+    if (namePart === "use-host-config-" || namePart === "app-server-manager-signals-") {
+      if (!clients.length) return null;
+      const out = {};
+      clients.forEach((client, index) => {
+        out[`client${index}`] = client;
+      });
+      return out;
+    }
+    if (namePart === "app-initial-" || namePart === "app-shared-") {
+      const out = {};
+      if (settings) {
+        out.n = settings.n;
+        out.s = settings.s;
+        out.jut = settings.n;
+        out.Put = settings.s;
+      }
+      if (typeof state === "function") out.qut = state;
+      if (dispatcher) out.dispatcher = dispatcher;
+      if (host) out.hostServices = host;
+      clients.forEach((client, index) => {
+        out[`client${index}`] = client;
+      });
+      return Object.keys(out).length ? out : null;
+    }
+    return null;
+  }
+
+  function codexRspackLiveNamespace(runtime, namePart) {
+    const current = () => codexRspackSemanticExports(namePart, codexRspackExportValues(runtime)) || {};
+    return new Proxy({}, {
+      get(_target, prop) {
+        if (prop === "__codexPlusAssetDiscovery") return "rspack-module-cache";
+        if (prop === "then") return undefined;
+        return current()[prop];
+      },
+      ownKeys() {
+        return Object.keys(current());
+      },
+      getOwnPropertyDescriptor(_target, prop) {
+        if (typeof prop !== "string") return undefined;
+        const exports = current();
+        if (!Object.prototype.hasOwnProperty.call(exports, prop)) return undefined;
+        return { configurable: true, enumerable: true, writable: true, value: exports[prop] };
+      },
+    });
+  }
+
+  function codexRspackPending(namePart) {
+    const error = new Error(`Codex rspack module pending: ${namePart}`);
+    error.code = "CODEX_PLUS_RSPACK_PENDING";
+    return error;
+  }
+
+  async function codexRspackSemanticNamespace(namePart) {
+    if (!codexRspackKnownPrefix(namePart)) return null;
+    const runtime = await codexRspackRequire();
+    if (!runtime) return null;
+    const exports = codexRspackSemanticExports(namePart, codexRspackExportValues(runtime));
+    if (!exports) throw codexRspackPending(namePart);
+    return codexRspackLiveNamespace(runtime, namePart);
+  }
+
+  async function loadRspackAppServerRequestModule() {
+    const runtime = await codexRspackRequire();
+    if (!runtime) return null;
+    const { clients } = codexRspackAppServerClients(codexRspackExportValues(runtime));
+    if (!clients.length) return null;
+    const synthetic = { __codexPlusAssetDiscovery: "rspack-module-cache" };
+    clients.forEach((client, index) => {
+      synthetic[`client${index}`] = client;
+    });
+    return synthetic;
+  }
+
+  async function codexRspackCaptureAppServerClientClass() {
+    const runtime = await codexRspackRequire();
+    if (!runtime) return null;
+    const found = codexRspackAppServerClients(codexRspackExportValues(runtime));
+    if (found.classes.length) {
+      const ctor = found.classes[0];
+      const via = codexFunctionSource(ctor).includes(codexAppServerClientCaptureMarker)
+        ? "rspack-export"
+        : "rspack-shape";
+      return { ctor, via };
+    }
+    if (found.clients.length) {
+      const ctor = found.clients[0]?.constructor;
+      return typeof ctor === "function" ? { ctor, via: "rspack-instance" } : null;
+    }
+    return null;
+  }
+
+  window.__codexPlusRspackCaptureAppServerClientClass = () => codexRspackCaptureAppServerClientClass();
 
   function appServerFallbackAssetUrls() {
     const urls = codexAppAssetCandidateUrls();
@@ -3752,16 +4107,21 @@
       seen.add(value);
       candidates.push(value);
     };
+    // 哈希分块里找到的是已经在跑的客户端。再调 .get() 会碰到 RPC stub，
+    // 旧的具名模块才需要把容器 .get("local") 展开。
+    const skipNestedGet = module?.__codexPlusAssetDiscovery === "rspack-module-cache";
     for (const value of Object.values(module || {})) {
       push(value);
       if (!value || typeof value !== "object") continue;
-      if (typeof value.get === "function") {
+      if (!skipNestedGet && typeof value.get === "function") {
         try { push(value.get()); } catch {}
         try { push(value.get("local")); } catch {}
       }
-      try {
-        for (const nested of Object.values(value).slice(0, 100)) push(nested);
-      } catch {}
+      if (!skipNestedGet) {
+        try {
+          for (const nested of Object.values(value).slice(0, 100)) push(nested);
+        } catch {}
+      }
     }
     return candidates;
   }
@@ -3792,6 +4152,12 @@
       } catch {
       }
     }
+    try {
+      const rspackModule = await loadRspackAppServerRequestModule();
+      if (rspackModule) pushModule(rspackModule, "rspack-module-cache");
+    } catch {
+      // 没有 Rspack runtime 时保持原来的具名前缀路径。
+    }
     return { modules, sources };
   }
 
@@ -3806,8 +4172,10 @@
         candidates.push(candidate);
       }
     }
-    const usedFallback = sources.some((source) => !source.endsWith("-"));
-    return { modules, candidates, sources, discovery: usedFallback ? "fallback" : "named-assets" };
+    const discovery = sources.includes("rspack-module-cache")
+      ? "rspack-module-cache"
+      : (sources.some((source) => !String(source).endsWith("-")) ? "fallback" : "named-assets");
+    return { modules, candidates, sources, discovery };
   }
 
   function codexSettingStorageFromModule(module, assetPrefix = "") {
@@ -5006,6 +5374,8 @@
   let serviceTierDispatcherPatchMissCount = 0;
   let serviceTierDispatcherPatchDisabled = false;
   let serviceTierDispatcherPatchPromise = null;
+  let serviceTierDispatcherPatchRspackSize = -1;
+  let serviceTierDispatcherPatchPendingSkips = 0;
 
   function codexServiceTierDispatcherPatchable(dispatcher) {
     if (!dispatcher || typeof dispatcher !== "object") return false;
@@ -5036,21 +5406,36 @@
       const errors = [];
       // 26.1016 起 dispatcher 类定义并导出在 app-shared-*，app-initial-* 只导入不再导出，
       // setting-storage-* / vscode-api-* 也已不存在；缺这个前缀整层请求改写都装不上（#2657）。
+      let pending = false;
       for (const assetPrefix of ["setting-storage-", "vscode-api-", "app-initial-", "app-shared-"]) {
         try {
           const module = await loadCodexAppModule(assetPrefix);
           const dispatcher = codexServiceTierDispatcherFromModule(module);
-          if (dispatcher) return { dispatcher, assetPrefix };
+          if (dispatcher) {
+            return {
+              dispatcher,
+              assetPrefix,
+              discovery: module?.__codexPlusAssetDiscovery || "",
+            };
+          }
+          if (module?.__codexPlusAssetDiscovery === "rspack-module-cache") {
+            pending = true;
+            errors.push(`${assetPrefix}: rspack pending`);
+            continue;
+          }
           errors.push(`${assetPrefix}: dispatcher export unavailable`);
         } catch (error) {
+          if (error?.code === "CODEX_PLUS_RSPACK_PENDING") pending = true;
           errors.push(`${assetPrefix}: ${error?.message || String(error)}`);
         }
       }
-      throw new Error(`Codex dispatcher unavailable (${errors.join("; ")})`);
+      const unavailable = new Error(`Codex dispatcher unavailable (${errors.join("; ")})`);
+      if (pending) unavailable.code = "CODEX_PLUS_RSPACK_PENDING";
+      throw unavailable;
     };
     const patch = async () => {
       try {
-        const { dispatcher, assetPrefix } = await loadDispatcher();
+        const { dispatcher, assetPrefix, discovery } = await loadDispatcher();
         if (!codexServiceTierDispatcherPatchable(dispatcher)) {
           throw new Error(`dispatcher is a non-writable RPC stub (${assetPrefix})`);
         }
@@ -5063,8 +5448,19 @@
         installCodexRemoteSessionDispatcherSubscription(dispatcher, assetPrefix);
         window.__codexServiceTierRequestOverrideInstalled = codexServiceTierRequestOverrideVersion;
         serviceTierDispatcherPatchMissCount = 0;
-        sendCodexPlusDiagnostic("service_tier_dispatcher_patch_installed", { assetPrefix });
+        const detail = { assetPrefix };
+        if (discovery) detail.discovery = discovery;
+        sendCodexPlusDiagnostic("service_tier_dispatcher_patch_installed", detail);
       } catch (error) {
+        if (error?.code === "CODEX_PLUS_RSPACK_PENDING") {
+          const size = typeof codexRspackModuleCount === "function" ? codexRspackModuleCount() : 0;
+          const growing = size > 0 && size !== serviceTierDispatcherPatchRspackSize;
+          if ((growing || serviceTierDispatcherPatchPendingSkips < 8) && serviceTierDispatcherPatchPendingSkips < 40) {
+            serviceTierDispatcherPatchRspackSize = size;
+            serviceTierDispatcherPatchPendingSkips += 1;
+            return;
+          }
+        }
         serviceTierDispatcherPatchMissCount += 1;
         if (serviceTierDispatcherPatchMissCount === 1) {
           sendCodexPlusDiagnostic("service_tier_dispatcher_patch_failed", {
@@ -10636,22 +11032,35 @@
   }
 
   async function codexStateApi() {
-    codexStateApiPromise = codexStateApiPromise || (async () => {
+    if (codexStateApiPromise) return await codexStateApiPromise;
+    const promise = (async () => {
       const errors = [];
+      let pending = false;
       // 前三项是历史前缀（列表字面量本身是契约的一部分，不要改写）；
       // app-shared- 是 26.930+ 的新位置，靠内容识别，不依赖压缩导出名。
+      // 26.1103 的数字哈希分块没有这些前缀，loadCodexAppModule 会改读已执行的 Rspack 导出。
       for (const assetPrefix of [...["vscode-api-", "app-initial-"], "app-shared-"]) {
         try {
           const api = await loadCodexAppModule(assetPrefix);
           const call = codexStateApiFromModule(api, assetPrefix);
           if (typeof call === "function") return call;
+          if (api?.__codexPlusAssetDiscovery === "rspack-module-cache") pending = true;
           errors.push(`${assetPrefix}: state export unavailable`);
         } catch (error) {
+          if (error?.code === "CODEX_PLUS_RSPACK_PENDING") pending = true;
           errors.push(`${assetPrefix}: ${error?.message || String(error)}`);
         }
       }
-      throw new Error(`Codex 状态 API 不可用 (${errors.join("; ")})`);
+      const unavailable = new Error(`Codex 状态 API 不可用 (${errors.join("; ")})`);
+      if (pending) unavailable.code = "CODEX_PLUS_RSPACK_PENDING";
+      throw unavailable;
     })();
+    codexStateApiPromise = promise;
+    promise.catch((error) => {
+      if (error?.code === "CODEX_PLUS_RSPACK_PENDING" && codexStateApiPromise === promise) {
+        codexStateApiPromise = null;
+      }
+    });
     return await codexStateApiPromise;
   }
 
@@ -12568,21 +12977,64 @@
   // 保证页面重载后自动重新捕获，且每次页面生命周期内只暂停一次。
     function locateCodexAppServerClientBreakpoint(text) {
     if (typeof text !== "string" || !text) return null;
-    const markerIdx = text.indexOf(codexAppServerClientCaptureMarker);
-    if (markerIdx < 0) return null;
-    const anchorIdx = text.lastIndexOf(codexAppServerClientCaptureAnchor, markerIdx);
-    if (anchorIdx < 0 || markerIdx - anchorIdx > 220) return null;
-    const braceIdx = text.indexOf("{", anchorIdx);
-    if (braceIdx < 0) return null;
-    let lineNumber = 0;
-    let lastNewline = -1;
-    for (let i = 0; i < braceIdx; i++) {
-      if (text.charCodeAt(i) === 10) {
-        lineNumber += 1;
-        lastNewline = i;
+    // 26.1103 的压缩函数在 async sendRequest( 和 marker 之间可能超过旧的 220 字符。
+    // 仍取 marker 前最近的锚点，避免落到更早的另一个方法上。
+    const anchorWindow = 2500;
+    let from = 0;
+    while (from < text.length) {
+      const markerIdx = text.indexOf(codexAppServerClientCaptureMarker, from);
+      if (markerIdx < 0) return null;
+      const anchorIdx = text.lastIndexOf(codexAppServerClientCaptureAnchor, markerIdx);
+      if (anchorIdx >= 0 && markerIdx - anchorIdx <= anchorWindow) {
+        const braceIdx = text.indexOf("{", anchorIdx);
+        if (braceIdx >= 0 && braceIdx < markerIdx) {
+          let lineNumber = 0;
+          let lastNewline = -1;
+          for (let i = 0; i < braceIdx; i++) {
+            if (text.charCodeAt(i) === 10) {
+              lineNumber += 1;
+              lastNewline = i;
+            }
+          }
+          return { lineNumber, columnNumber: braceIdx - lastNewline - 1 };
+        }
       }
+      from = markerIdx + codexAppServerClientCaptureMarker.length;
     }
-    return { lineNumber, columnNumber: braceIdx - lastNewline - 1 };
+    return null;
+  }
+
+  function codexAppServerClientClassMatches(ctor) {
+    if (typeof ctor !== "function" || typeof ctor.prototype?.sendRequest !== "function") return false;
+    let source = "";
+    let method = "";
+    try { source = Function.prototype.toString.call(ctor); } catch { source = ""; }
+    try { method = Function.prototype.toString.call(ctor.prototype.sendRequest); } catch { method = ""; }
+    if (source.includes(codexAppServerClientCaptureMarker) || method.includes(codexAppServerClientCaptureMarker)) return true;
+    return method.includes("enqueueRequest") && method.includes("dispatchMessage");
+  }
+
+  // 入口脚本用相对路径 import 出数字哈希分块。只收集 ./ 相对路径，不展开整张 chunk map。
+  function codexRspackRelativeAssetUrls(source, baseUrl) {
+    if (typeof source !== "string" || typeof baseUrl !== "string" || !baseUrl) return [];
+    const found = [];
+    const seen = new Set();
+    const push = (spec) => {
+      if (typeof spec !== "string" || !spec.startsWith("./")) return;
+      if (spec.includes("..") || spec.includes("\\") || spec.includes("//")) return;
+      let href = "";
+      try { href = new URL(spec, baseUrl).href; } catch { return; }
+      const path = href.split("?")[0];
+      if (!path.includes("/assets/") || !path.endsWith(".js") || seen.has(href)) return;
+      seen.add(href);
+      found.push(href);
+    };
+    const registration = source.match(/import\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s+from\s*["'](\.\/[^"']+\.js)["']\s*;?\s*[A-Za-z_$][\w$]*\.C\(\s*\1\s*\)/);
+    if (registration) push(registration[2]);
+    const re = /["'](\.\/[^"'\\\s]+\.js)["']/g;
+    let item;
+    while ((item = re.exec(source))) push(item[1]);
+    return found;
   }
 
   // issue #2399：抓取目标不能再按 asset 文件名前缀写死。Codex 26.930 把
@@ -12593,10 +13045,21 @@
   // 排序只做「可能的更靠前」的启发式，不影响正确性；命中全靠文本匹配。
   const codexAppServerClientBundleHints = ["app-shared-", "app-initial-", "app-main-", "chatg"];
   const codexAppServerClientAssetFetchLimit = 24;
+  const codexAppServerClientGraphFetchLimit = 8;
 
   // 已经拉过全文、确认不含类定义的资产。重试时只看新出现的候选，
   // 不会因为多试几轮就把同一批大文件反复 fetch（#1960 / #2330 的教训）。
   const codexAppServerClientCheckedUrls = new Set();
+  const codexAppServerClientGraphUrls = [];
+  let codexAppServerClientGraphFetches = 0;
+
+  function codexRememberRspackAssetUrls(urls) {
+    for (const url of urls) {
+      if (codexAppServerClientGraphUrls.length >= codexAppServerClientGraphFetchLimit) return;
+      if (!url || codexAppServerClientGraphUrls.includes(url)) continue;
+      codexAppServerClientGraphUrls.push(url);
+    }
+  }
 
   function codexAppServerClientAssetCandidateUrls() {
     const urls = codexAppAssetCandidateUrls().filter((url) => !codexAppServerClientCheckedUrls.has(url));
@@ -12613,28 +13076,50 @@
       .slice(0, codexAppServerClientAssetFetchLimit);
   }
 
-  // 返回 { url, location }；找不到返回 null。diagnostics 由调用方按命中/未命中归类。
+  // 返回 { urls, hit }。urls 是这一轮实际检查的地址；全部已检查过时 urls 为空。
   async function locateCodexAppServerClientInAssets() {
-    const urls = codexAppServerClientAssetCandidateUrls();
-    if (urls.length === 0) return { urls, hit: null };
-    // 先走廉价的 asset loader（有 30s 失败冷却与重试上限），脚本里已经内联了
-    // asset 名时能直接命中，省掉整轮 fetch；不可用就退回到全量文本匹配。
+    const visible = codexAppServerClientAssetCandidateUrls();
     const hinted = resolveCodexAppServerClientHintedUrl();
-    const ordered = hinted && !codexAppServerClientCheckedUrls.has(hinted)
-      ? [hinted, ...urls.filter((url) => url !== hinted)]
-      : urls;
-    for (const url of ordered) {
+    const queue = [];
+    const queued = new Set();
+    const enqueue = (url) => {
+      if (!url || queued.has(url) || codexAppServerClientCheckedUrls.has(url)) return;
+      if (queue.length >= codexAppServerClientAssetFetchLimit) return;
+      queued.add(url);
+      queue.push(url);
+    };
+    if (hinted && !codexAppServerClientCheckedUrls.has(hinted)) enqueue(hinted);
+    for (const url of visible) enqueue(url);
+    for (const url of codexAppServerClientGraphUrls) enqueue(url);
+    if (queue.length === 0) return { urls: [], hit: null };
+    const considered = [];
+    const visibleSet = new Set(visible);
+    if (hinted) visibleSet.add(hinted);
+    while (queue.length && considered.length < codexAppServerClientAssetFetchLimit) {
+      const url = queue.shift();
+      considered.push(url);
       try {
         const text = await fetch(url).then((response) => response.ok ? response.text() : "");
         if (!text) continue;
         const location = locateCodexAppServerClientBreakpoint(text);
-        if (location) return { urls, hit: { url, location } };
+        if (location) {
+          const discovery = !visibleSet.has(url) && codexAppServerClientGraphUrls.includes(url)
+            ? "rspack-import-graph"
+            : "visible-asset";
+          return { urls: considered, hit: { url, location, discovery } };
+        }
         codexAppServerClientCheckedUrls.add(url);
+        if (codexAppServerClientGraphUrls.includes(url)) codexAppServerClientGraphFetches += 1;
+        const room = codexAppServerClientGraphFetchLimit - codexAppServerClientGraphUrls.length;
+        if (room > 0) {
+          codexRememberRspackAssetUrls(codexRspackRelativeAssetUrls(text, url).slice(0, room));
+          for (const next of codexAppServerClientGraphUrls) enqueue(next);
+        }
       } catch {
         // 单个 asset 拉取失败不影响其余候选，继续下一个；没记成已检查，下一轮还会再试。
       }
     }
-    return { urls, hit: null };
+    return { urls: considered, hit: null };
   }
 
   // 兼容旧路径：asset 名确实内联在入口脚本里时，用 loader 的缓存直接拿到 URL，
@@ -12653,13 +13138,53 @@
   // 报 anchor_missing 后本页再也不试，launcher 等不到坐标就放弃捕获，依赖原型补丁的功能全部失效。
   // 所以未命中时按退避重试；总时长控制在 launcher 90s 的坐标等待窗口之内。
   const codexAppServerClientCaptureRetryDelaysMs = [1000, 2000, 4000, 8000, 15000, 15000, 15000];
+  const codexAppServerClientCaptureVias = new Set(["rspack-export", "rspack-shape", "rspack-instance", "app-server-manager"]);
   let codexAppServerClientCaptureStarted = false;
   let codexAppServerClientCaptureAttempts = 0;
+
+  function publishCodexAppServerClientClass(ctor, via) {
+    if (!codexAppServerClientClassMatches(ctor)) return false;
+    window.__codexPlusAppServerClientClass = ctor;
+    sendCodexPlusDiagnostic("app_server_client_class_captured", {
+      via: codexAppServerClientCaptureVias.has(via) ? via : "rspack-export",
+    });
+    if (typeof installCodexAppServerClientPrototypePatch === "function") {
+      try { installCodexAppServerClientPrototypePatch(); } catch {}
+    }
+    return true;
+  }
+
+  // 类已经在 Rspack 模块缓存或 AppServerManager 里时，直接发布构造器。
+  // 这样不依赖断点 URL：Fast 的 import map 会把分块执行切到 blob，按原资产 URL 下的断点打不中。
+  async function publishCodexAppServerClientClassFromRuntime() {
+    const hook = window.__codexPlusRspackCaptureAppServerClientClass;
+    if (typeof hook === "function") {
+      try {
+        const found = await hook();
+        if (publishCodexAppServerClientClass(found?.ctor, found?.via || "rspack-export")) return true;
+      } catch {}
+    }
+    if (typeof codexPlusAppServerClient === "function") {
+      try {
+        const client = await codexPlusAppServerClient("local");
+        if (publishCodexAppServerClientClass(client?.constructor, "app-server-manager")) return true;
+      } catch {}
+    }
+    return false;
+  }
+
   async function installCodexAppServerClientCapture() {
-    if (codexAppServerClientCaptureStarted || window.__codexPlusAppServerClientCapture) return;
+    if (window.__codexPlusAppServerClientClass || window.__codexPlusAppServerClientCapture) {
+      if (typeof installCodexAppServerClientPrototypePatch === "function") {
+        try { installCodexAppServerClientPrototypePatch(); } catch {}
+      }
+      return;
+    }
+    if (codexAppServerClientCaptureStarted) return;
     codexAppServerClientCaptureStarted = true;
     codexAppServerClientCaptureAttempts += 1;
     try {
+      if (await publishCodexAppServerClientClassFromRuntime()) return;
       if (typeof fetch !== "function") return;
       const { urls, hit } = await locateCodexAppServerClientInAssets();
       if (!hit) {
@@ -12678,6 +13203,7 @@
           candidateCount: urls.length,
           checkedCount: codexAppServerClientCheckedUrls.size,
           attempts: codexAppServerClientCaptureAttempts,
+          graphFetchCount: codexAppServerClientGraphFetches,
         });
         return;
       }
@@ -12688,6 +13214,8 @@
         columnNumber: hit.location.columnNumber,
         asset: (hit.url.split("/").pop() || "").split("?")[0],
         attempts: codexAppServerClientCaptureAttempts,
+        discovery: hit.discovery || "visible-asset",
+        graphFetchCount: codexAppServerClientGraphFetches,
       });
     } catch (error) {
       codexAppServerClientCaptureStarted = false;
@@ -12872,8 +13400,22 @@
       try {
         const { modules, candidates, sources, discovery } = await loadAppServerRequestCandidates();
         if (modules.length === 0) {
+          // 原型补丁已经套上 sendRequest 时，模型列表走的就是这条路径。
+          // 没有可枚举的实例也不该再报 assets_missing。
+          if (window.__codexPlusAppServerClientPrototypePatchInstalled === codexAppServerModelRequestPatchVersion) {
+            window.__codexPlusAppServerModelRequestPatchInstalled = codexAppServerModelRequestPatchVersion;
+            sendCodexPlusDiagnostic("model_app_server_request_patch_installed", {
+              moduleCount: 0,
+              candidateCount: 0,
+              patchedCount: 0,
+              sources: ["rspack-prototype"],
+              discovery: "rspack-prototype",
+            });
+            return;
+          }
           noteAppServerModelRequestPatchMiss("model_app_server_request_patch_skipped", {
             reason: "app_server_request_assets_missing",
+            ...(typeof codexRspackModuleCount === "function" && codexRspackModuleCount() > 0 ? { rspack: true } : {}),
           });
           return;
         }

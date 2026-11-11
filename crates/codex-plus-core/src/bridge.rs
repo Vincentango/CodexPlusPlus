@@ -695,23 +695,74 @@ pub fn app_server_client_capture_condition() -> &'static str {
     "!window.__codexPlusAppServerClientClass"
 }
 
-pub fn app_server_client_capture_probe_script() -> &'static str {
-    "JSON.stringify(window.__codexPlusAppServerClientCapture || null)"
+/// 渲染层先把构造器挂到 `window.__codexPlusAppServerClientClass` 时，不再按 URL 下断点。
+/// 26.1103 的分块是数字哈希，Fast 的 import map 还会把执行切到 blob，原资产 URL 上的断点打不中。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppServerClientCaptureObservation {
+    Pending,
+    ClassReady,
+    Location {
+        url_regex: String,
+        line_number: u32,
+        column_number: u32,
+    },
+}
+
+pub fn app_server_client_capture_probe_script(wait_for_native_fast: bool) -> &'static str {
+    if wait_for_native_fast {
+        "window.__codexPlusNativeFastAssetPatchReady===true&&['armed','patched'].includes(window.__codexPlusNativeFastPatchState)&&window.__codexPlusNativeFastCompiled!=='v1'?null:JSON.stringify({classReady:typeof window.__codexPlusAppServerClientClass===\"function\",capture:window.__codexPlusAppServerClientCapture||null})"
+    } else {
+        "JSON.stringify({classReady:typeof window.__codexPlusAppServerClientClass===\"function\",capture:window.__codexPlusAppServerClientCapture||null})"
+    }
 }
 
 pub fn parse_app_server_client_capture_location(value: &Value) -> Option<(String, u32, u32)> {
-    let text = value.as_str()?;
-    let parsed: Value = serde_json::from_str(text).ok()?;
-    let url_regex = parsed.get("urlRegex")?.as_str()?.to_string();
+    match parse_app_server_client_capture_observation(value) {
+        AppServerClientCaptureObservation::Location {
+            url_regex,
+            line_number,
+            column_number,
+        } => Some((url_regex, line_number, column_number)),
+        _ => None,
+    }
+}
+
+pub fn parse_app_server_client_capture_observation(
+    value: &Value,
+) -> AppServerClientCaptureObservation {
+    let Some(text) = value.as_str() else {
+        return AppServerClientCaptureObservation::Pending;
+    };
+    if text.is_empty() || text == "null" {
+        return AppServerClientCaptureObservation::Pending;
+    }
+    let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+        return AppServerClientCaptureObservation::Pending;
+    };
+    if parsed.get("classReady").and_then(Value::as_bool) == Some(true) {
+        return AppServerClientCaptureObservation::ClassReady;
+    }
+    let capture = parsed.get("capture").cloned().unwrap_or(parsed);
+    let Some(url_regex) = capture.get("urlRegex").and_then(Value::as_str) else {
+        return AppServerClientCaptureObservation::Pending;
+    };
     if url_regex.is_empty() {
-        return None;
+        return AppServerClientCaptureObservation::Pending;
     }
-    let line_number = parsed.get("lineNumber")?.as_u64()?;
-    let column_number = parsed.get("columnNumber")?.as_u64()?;
+    let Some(line_number) = capture.get("lineNumber").and_then(Value::as_u64) else {
+        return AppServerClientCaptureObservation::Pending;
+    };
+    let Some(column_number) = capture.get("columnNumber").and_then(Value::as_u64) else {
+        return AppServerClientCaptureObservation::Pending;
+    };
     if line_number > u32::MAX as u64 || column_number > u32::MAX as u64 {
-        return None;
+        return AppServerClientCaptureObservation::Pending;
     }
-    Some((url_regex, line_number as u32, column_number as u32))
+    AppServerClientCaptureObservation::Location {
+        url_regex: url_regex.to_string(),
+        line_number: line_number as u32,
+        column_number: column_number as u32,
+    }
 }
 
 const APP_SERVER_CLIENT_CAPTURE_LOCATION_TIMEOUT: Duration = Duration::from_secs(90);
@@ -838,11 +889,9 @@ async fn run_app_server_client_capture(
     }
     let socket = connect_cdp_websocket(websocket_url).await?;
     let mut session = CdpSession::new(socket);
-    let probe_script = if crate::native_predictions::native_modules_requested(&settings) {
-        "window.__codexPlusNativeFastAssetPatchReady===true&&['armed','patched'].includes(window.__codexPlusNativeFastPatchState)&&window.__codexPlusNativeFastCompiled!=='v1'?null:JSON.stringify(window.__codexPlusAppServerClientCapture||null)"
-    } else {
-        app_server_client_capture_probe_script()
-    };
+    let probe_script = app_server_client_capture_probe_script(
+        crate::native_predictions::native_modules_requested(&settings),
+    );
     let location_wait = async {
         loop {
             if !bridge_generation_is_current(&generation) {
@@ -865,14 +914,13 @@ async fn run_app_server_client_capture(
             else {
                 continue;
             };
-            if let Some(location) =
-                parse_app_server_client_capture_location(&Value::String(text.to_string()))
-            {
-                return Some(location);
+            match parse_app_server_client_capture_observation(&Value::String(text.to_string())) {
+                AppServerClientCaptureObservation::Pending => continue,
+                observation => return Some(observation),
             }
         }
     };
-    let Some((url_regex, line_number, column_number)) =
+    let Some(observation) =
         tokio::time::timeout(APP_SERVER_CLIENT_CAPTURE_LOCATION_TIMEOUT, location_wait)
             .await
             .unwrap_or(None)
@@ -880,6 +928,19 @@ async fn run_app_server_client_capture(
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "bridge.app_server_client_capture_skipped",
             json!({ "reason": "capture_location_unavailable" }),
+        );
+        return Ok(());
+    };
+    let AppServerClientCaptureObservation::Location {
+        url_regex,
+        line_number,
+        column_number,
+    } = observation
+    else {
+        // 渲染层已经从 Rspack 模块缓存拿到构造器并会套原型补丁，断点不会打在 blob URL 上。
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "bridge.app_server_client_captured",
+            json!({ "via": "renderer-class" }),
         );
         return Ok(());
     };

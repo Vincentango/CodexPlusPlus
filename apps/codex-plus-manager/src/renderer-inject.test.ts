@@ -618,8 +618,187 @@ describe("app-server client capture locating", () => {
     assert.equal(env.fetched.length, 1);
     assert.deepEqual(env.diagnostics, [{
       event: "app_server_client_capture_locate_failed",
-      detail: { reason: "anchor_missing", candidateCount: 0, checkedCount: 1, attempts: delays.length + 1 },
+      detail: { reason: "anchor_missing", candidateCount: 0, checkedCount: 1, attempts: delays.length + 1, graphFetchCount: 0 },
     }]);
+  });
+
+  it("follows a rspack relative import to a hashed chunk without hardcoding the filename", async () => {
+    const runtimeUrl = "app://-/assets/100.aaaaaaaa.js";
+    const chunkUrl = "app://-/assets/782259.7a3e865ee5.js";
+    const noiseUrl = "app://-/assets/999.bbbbbbbb.js";
+    const runtimeSource = 'import*as support from"./782259.7a3e865ee5.js";require.C(support);import*as noise from"./999.bbbbbbbb.js";';
+    const env = await runtime({
+      [runtimeUrl]: runtimeSource,
+      [chunkUrl]: classSource,
+      [noiseUrl]: "export const noise=1;",
+    });
+    env.visible.push(runtimeUrl);
+    await env.api.installCodexAppServerClientCapture();
+    assert.deepEqual(env.fetched, [runtimeUrl, chunkUrl]);
+    const capture = env.window.__codexPlusAppServerClientCapture as { urlRegex: string; lineNumber: number };
+    assert.equal(capture.urlRegex, "app://-/assets/782259\\.7a3e865ee5\\.js");
+    assert.equal(capture.lineNumber, 1);
+    const detail = env.diagnostics.at(-1)?.detail;
+    assert.equal(env.diagnostics.at(-1)?.event, "app_server_client_capture_located");
+    assert.equal(detail?.discovery, "rspack-import-graph");
+    assert.equal(detail?.asset, "782259.7a3e865ee5.js");
+    assert.equal(detail?.source, undefined);
+    assert.doesNotMatch(JSON.stringify(detail), /enqueueRequest|missing a message dispatcher/);
+  });
+
+  it("publishes the app-server class from the rspack module cache without fetching chunks", async () => {
+    class Client {
+      sendRequest() {
+        throw new Error("AppServerRequestClient is missing a message dispatcher");
+      }
+    }
+    const env = await runtime({});
+    env.window.__codexPlusRspackCaptureAppServerClientClass = async () => ({ ctor: Client, via: "rspack-export" });
+    await env.api.installCodexAppServerClientCapture();
+    assert.equal(env.fetched.length, 0);
+    assert.equal(env.window.__codexPlusAppServerClientClass, Client);
+    assert.deepEqual(env.diagnostics, [{
+      event: "app_server_client_class_captured",
+      detail: { via: "rspack-export" },
+    }]);
+    assert.doesNotMatch(JSON.stringify(env.diagnostics), /sendRequest|dispatcher/);
+  });
+
+  it("still locates sendRequest when the marker sits further than 220 characters after the anchor", async () => {
+    const bundled = "app://-/assets/100.cccccccc.js";
+    const source = `async sendRequest(e,t,n){${"x".repeat(800)}throw Error(\`${marker}\`);}`;
+    const env = await runtime({ [bundled]: source });
+    env.visible.push(bundled);
+    await env.api.installCodexAppServerClientCapture();
+    const capture = env.window.__codexPlusAppServerClientCapture as { lineNumber: number; columnNumber: number };
+    assert.equal(capture.lineNumber, 0);
+    assert.equal(capture.columnNumber, source.indexOf("{"));
+    assert.equal(env.diagnostics.at(-1)?.detail.discovery, "visible-asset");
+  });
+
+  it("does not treat a far marker as the sendRequest breakpoint", async () => {
+    const bundled = "app://-/assets/100.dddddddd.js";
+    const source = `async sendRequest(e,t,n){${"x".repeat(4000)}throw Error(\`${marker}\`);}`;
+    const env = await runtime({ [bundled]: source });
+    env.visible.push(bundled);
+    await env.api.installCodexAppServerClientCapture();
+    while (env.timers.length) await env.fireTimer();
+    assert.equal(env.fetched.length, 1);
+    assert.equal(env.window.__codexPlusAppServerClientCapture, undefined);
+    assert.equal(env.diagnostics.at(-1)?.event, "app_server_client_capture_locate_failed");
+    assert.equal(env.diagnostics.at(-1)?.detail.reason, "anchor_missing");
+  });
+});
+
+describe("rspack hashed asset semantic discovery", () => {
+  const marker = "AppServerRequestClient is missing a message dispatcher";
+
+  function discoveryRuntime() {
+    return readFile(new URL("../../../assets/inject/renderer-inject/20-menu.js", import.meta.url), "utf8")
+      .then((menu) => {
+        const start = menu.indexOf("  // Codex 26.1103");
+        const end = menu.indexOf("  function appServerFallbackAssetUrls(", start);
+        assert.ok(start >= 0 && end > start);
+        const create = new Function(
+          "window",
+          "document",
+          "codexAppServerClientCaptureMarker",
+          `${menu.slice(start, end)}\nreturn { codexRspackSemanticNamespace, codexRspackRequire, loadRspackAppServerRequestModule, codexRspackCaptureAppServerClientClass };`,
+        ) as (window: Record<string, unknown>, document: { scripts: Array<{ src: string }> }, marker: string) => {
+          codexRspackSemanticNamespace: (name: string) => Promise<Record<string, unknown> | null>;
+          loadRspackAppServerRequestModule: () => Promise<Record<string, unknown> | null>;
+          codexRspackCaptureAppServerClientClass: () => Promise<{ ctor: unknown; via: string } | null>;
+        };
+        const settingStart = menu.indexOf("  function codexSettingStorageFromModule(");
+        const settingEnd = menu.indexOf("\n  async function codexSettingStorageModule(", settingStart);
+        const settingFromModule = new Function(
+          `${menu.slice(settingStart, settingEnd)}\nreturn codexSettingStorageFromModule;`,
+        )() as (module: Record<string, unknown>, prefix: string) => { n: unknown; s: unknown } | null;
+        const collectStart = menu.indexOf("  function collectAppServerRequestCandidatesFromModule(");
+        const collectEnd = menu.indexOf("\n  async function loadAppServerRequestModules(", collectStart);
+        const collect = new Function(
+          `${menu.slice(collectStart, collectEnd)}\nreturn collectAppServerRequestCandidatesFromModule;`,
+        )() as (module: Record<string, unknown>) => unknown[];
+        return { menu, create, settingFromModule, collect };
+      });
+  }
+
+  it("reads dispatcher, settings and app-server clients from evaluated rspack exports", async () => {
+    const { create, settingFromModule, collect } = await discoveryRuntime();
+    const entry = "app://-/assets/100.aaaaaaaa.js";
+    const chunk = "app://-/assets/782259.7a3e865ee5.js";
+    const lazy = "app://-/assets/300.dddddddd.js";
+    let executed = false;
+    class Client {
+      sendRequest() {
+        if (this.dispatchMessage == null) throw new Error("AppServerRequestClient is missing a message dispatcher");
+        return this.enqueueRequest();
+      }
+    }
+    class Dispatcher {
+      static instance: Dispatcher | null = null;
+      static getInstance() { return (this.instance ??= new Dispatcher()); }
+      dispatchMessage() {}
+      subscribe() {}
+    }
+    function getSetting(_method: unknown, params: { key: string }) {
+      return `get-setting ${params.key}`;
+    }
+    function setSetting(_method: unknown, params: { key: string }) {
+      return `set-setting ${params.key}`;
+    }
+    function stateCall(method: string, params: unknown) {
+      return `${method} get-global-state set-global-state ${JSON.stringify(params)}`;
+    }
+    const host = { settings: { write() {}, readAll() { return { values: {} }; } }, applicationState: {} };
+    const client = new Client();
+    const runtime = {
+      m: { lazy() { executed = true; throw new Error("executed"); } },
+      c: { ready: { exports: { Client, Dispatcher, getSetting, setSetting, stateCall, host, client } } },
+    };
+    const imported: string[] = [];
+    const window: Record<string, unknown> = {
+      __codexPlusImportRspackEntry: async (url: string) => {
+        imported.push(url);
+        if (url === entry) return { __webpack_require__: runtime };
+        return {};
+      },
+    };
+    const document = { scripts: [{ src: chunk }, { src: entry }, { src: "app://-/assets/app-initial-old.js" }] };
+    const api = create(window, document, marker);
+
+    assert.equal(await api.codexRspackSemanticNamespace("not-a-prefix"), null);
+    assert.deepEqual(imported, []);
+
+    const shared = await api.codexRspackSemanticNamespace("app-shared-");
+    assert.equal(shared?.__codexPlusAssetDiscovery, "rspack-module-cache");
+    assert.equal(typeof (shared?.dispatcher as { dispatchMessage?: unknown })?.dispatchMessage, "function");
+    assert.equal(shared?.hostServices, host);
+    assert.equal(String(shared?.qut).includes("get-global-state"), true);
+    const settings = settingFromModule(await api.codexRspackSemanticNamespace("setting-storage-"), "setting-storage-");
+    assert.equal(settings?.n, getSetting);
+    assert.equal(settings?.s, setSetting);
+    const requestModule = await api.loadRspackAppServerRequestModule();
+    assert.equal(requestModule?.__codexPlusAssetDiscovery, "rspack-module-cache");
+    assert.ok(collect(requestModule || {}).includes(client));
+    const captured = await api.codexRspackCaptureAppServerClientClass();
+    assert.equal(captured?.ctor, Client);
+    assert.equal(captured?.via, "rspack-export");
+    assert.equal(executed, false);
+    assert.deepEqual(imported, [chunk, entry]);
+    assert.ok(!imported.includes(lazy));
+  });
+
+  it("keeps the named asset import ahead of rspack discovery and does not hardcode chunk hashes", async () => {
+    const menu = await readFile(new URL("../../../assets/inject/renderer-inject/20-menu.js", import.meta.url), "utf8");
+    const catalog = await readFile(new URL("../../../assets/inject/renderer-inject/70-model-catalog.js", import.meta.url), "utf8");
+    const loader = menu.slice(menu.indexOf("async function loadCodexAppModule"), menu.indexOf("async function loadOptionalCodexAppModule"));
+    const named = loader.indexOf("if (url) return await import(url);");
+    const semantic = loader.indexOf("codexRspackSemanticNamespace");
+    assert.ok(named >= 0 && semantic > named);
+    assert.doesNotMatch(menu, /7a3e865ee5|782259\.7a3e865ee5\.js/);
+    assert.doesNotMatch(catalog, /7a3e865ee5|782259\.7a3e865ee5\.js/);
+    assert.match(menu, /\["setting-storage-", "vscode-api-", "app-initial-", "app-shared-"\]|setting-storage-/);
   });
 });
 
@@ -2479,6 +2658,49 @@ describe("renderer injection app-server model request patch", () => {
 
     assert.equal(harness.sweeps(), 1);
     assert.deepEqual(harness.diagnostics(), ["model_app_server_request_patch_installed"]);
+  });
+
+  it("reports the model request patch installed once the rspack prototype patch is already in place", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const start = renderer.indexOf("  const appServerModelRequestPatchMaxMisses = ");
+    const end = renderer.indexOf("\n  function ensureCodexModelWhitelistInstalls(", start);
+    const diagnostics: Array<{ event: string; detail: Record<string, unknown> }> = [];
+    const fakeWindow: Record<string, unknown> = {
+      __codexPlusAppServerClientPrototypePatchInstalled: "38",
+      setTimeout: () => 0,
+      clearTimeout: () => {},
+    };
+    const install = new Function(
+      "window",
+      "codexAppServerModelRequestPatchVersion",
+      "codexRemoteSessionProviderPatchEnabled",
+      "loadAppServerRequestCandidates",
+      "patchAppServerModelRequestClient",
+      "sendCodexPlusDiagnostic",
+      "Date",
+      `${renderer.slice(start, end)}\nreturn installAppServerModelRequestPatch;`,
+    )(
+      fakeWindow,
+      "38",
+      () => false,
+      async () => ({ modules: [], candidates: [], sources: [], discovery: "named-assets" }),
+      () => false,
+      (event: string, detail: Record<string, unknown>) => diagnostics.push({ event, detail }),
+      Date,
+    ) as () => void;
+    install();
+    for (let i = 0; i < 8; i += 1) await Promise.resolve();
+    assert.deepEqual(diagnostics, [{
+      event: "model_app_server_request_patch_installed",
+      detail: {
+        moduleCount: 0,
+        candidateCount: 0,
+        patchedCount: 0,
+        sources: ["rspack-prototype"],
+        discovery: "rspack-prototype",
+      },
+    }]);
+    assert.doesNotMatch(JSON.stringify(diagnostics), /sendRequest|asset source|7a3e865ee5/);
   });
 });
 

@@ -14927,7 +14927,13 @@ model_reasoning_effort = "high"
     }
 
     fn verbatim_windows_path(path: &Path) -> PathBuf {
-        PathBuf::from(format!(r"\\?\{}", path.display()))
+        let text = path.to_string_lossy();
+        // Windows canonicalize already returns `\\?\`. Prefixing again makes
+        // `\\?\\?\...`, which the identity comparison only strips once.
+        if text.starts_with(r"\\?\") {
+            return path.to_path_buf();
+        }
+        PathBuf::from(format!(r"\\?\{text}"))
     }
 
     /// #3021: Store upgrade deletes the package directory. The manifest still

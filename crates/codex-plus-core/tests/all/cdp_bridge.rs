@@ -3375,7 +3375,7 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"37\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"38\""));
 
     assert!(script.contains("list-models-for-host"));
     assert!(script.contains("appServerModelRequestMethod"));
@@ -6389,6 +6389,56 @@ fn parse_app_server_client_capture_location_reads_renderer_report() {
     assert!(bridge::parse_app_server_client_capture_location(&json!("null")).is_none());
     assert!(bridge::parse_app_server_client_capture_location(&json!("{}")).is_none());
     assert!(bridge::parse_app_server_client_capture_location(&json!("")).is_none());
+}
+
+#[test]
+fn parse_app_server_client_capture_observation_prefers_renderer_class() {
+    use bridge::AppServerClientCaptureObservation;
+
+    let probe = bridge::app_server_client_capture_probe_script(false);
+    assert!(probe.contains("classReady"));
+    assert!(probe.contains("__codexPlusAppServerClientClass"));
+    assert!(!probe.contains("getScriptSource"));
+    assert!(!probe.contains("7a3e865ee5"));
+    let fast = bridge::app_server_client_capture_probe_script(true);
+    assert!(fast.contains("__codexPlusNativeFastCompiled"));
+    assert!(fast.contains("classReady"));
+
+    assert_eq!(
+        bridge::parse_app_server_client_capture_observation(&json!("null")),
+        AppServerClientCaptureObservation::Pending
+    );
+    let class_ready = json!({ "classReady": true, "capture": null }).to_string();
+    assert_eq!(
+        bridge::parse_app_server_client_capture_observation(&json!(class_ready)),
+        AppServerClientCaptureObservation::ClassReady
+    );
+    let located = json!({
+        "classReady": false,
+        "capture": { "urlRegex": "app://-/assets/1.abc.js", "lineNumber": 2, "columnNumber": 3 }
+    })
+    .to_string();
+    assert_eq!(
+        bridge::parse_app_server_client_capture_observation(&json!(located)),
+        AppServerClientCaptureObservation::Location {
+            url_regex: "app://-/assets/1.abc.js".to_string(),
+            line_number: 2,
+            column_number: 3,
+        }
+    );
+}
+
+#[test]
+fn injection_script_discovers_rspack_assets_by_shape_not_hash() {
+    let script = assets::injection_script(57321);
+    assert!(script.contains("rspack-module-cache"));
+    assert!(script.contains("app_server_client_class_captured"));
+    assert!(script.contains("app_server_client_capture_located"));
+    assert!(script.contains("model_app_server_request_patch_installed"));
+    assert!(script.contains("service_tier_dispatcher_patch_installed"));
+    assert!(script.contains("codexRspackRelativeAssetUrls"));
+    assert!(!script.contains("7a3e865ee5"));
+    assert!(!script.contains("782259.7a3e865ee5.js"));
 }
 
 #[test]

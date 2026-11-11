@@ -1874,22 +1874,35 @@
   }
 
   async function codexStateApi() {
-    codexStateApiPromise = codexStateApiPromise || (async () => {
+    if (codexStateApiPromise) return await codexStateApiPromise;
+    const promise = (async () => {
       const errors = [];
+      let pending = false;
       // 前三项是历史前缀（列表字面量本身是契约的一部分，不要改写）；
       // app-shared- 是 26.930+ 的新位置，靠内容识别，不依赖压缩导出名。
+      // 26.1103 的数字哈希分块没有这些前缀，loadCodexAppModule 会改读已执行的 Rspack 导出。
       for (const assetPrefix of [...["vscode-api-", "app-initial-"], "app-shared-"]) {
         try {
           const api = await loadCodexAppModule(assetPrefix);
           const call = codexStateApiFromModule(api, assetPrefix);
           if (typeof call === "function") return call;
+          if (api?.__codexPlusAssetDiscovery === "rspack-module-cache") pending = true;
           errors.push(`${assetPrefix}: state export unavailable`);
         } catch (error) {
+          if (error?.code === "CODEX_PLUS_RSPACK_PENDING") pending = true;
           errors.push(`${assetPrefix}: ${error?.message || String(error)}`);
         }
       }
-      throw new Error(`Codex 状态 API 不可用 (${errors.join("; ")})`);
+      const unavailable = new Error(`Codex 状态 API 不可用 (${errors.join("; ")})`);
+      if (pending) unavailable.code = "CODEX_PLUS_RSPACK_PENDING";
+      throw unavailable;
     })();
+    codexStateApiPromise = promise;
+    promise.catch((error) => {
+      if (error?.code === "CODEX_PLUS_RSPACK_PENDING" && codexStateApiPromise === promise) {
+        codexStateApiPromise = null;
+      }
+    });
     return await codexStateApiPromise;
   }
 

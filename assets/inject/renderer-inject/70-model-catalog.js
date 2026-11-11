@@ -1146,21 +1146,64 @@
   // 保证页面重载后自动重新捕获，且每次页面生命周期内只暂停一次。
     function locateCodexAppServerClientBreakpoint(text) {
     if (typeof text !== "string" || !text) return null;
-    const markerIdx = text.indexOf(codexAppServerClientCaptureMarker);
-    if (markerIdx < 0) return null;
-    const anchorIdx = text.lastIndexOf(codexAppServerClientCaptureAnchor, markerIdx);
-    if (anchorIdx < 0 || markerIdx - anchorIdx > 220) return null;
-    const braceIdx = text.indexOf("{", anchorIdx);
-    if (braceIdx < 0) return null;
-    let lineNumber = 0;
-    let lastNewline = -1;
-    for (let i = 0; i < braceIdx; i++) {
-      if (text.charCodeAt(i) === 10) {
-        lineNumber += 1;
-        lastNewline = i;
+    // 26.1103 的压缩函数在 async sendRequest( 和 marker 之间可能超过旧的 220 字符。
+    // 仍取 marker 前最近的锚点，避免落到更早的另一个方法上。
+    const anchorWindow = 2500;
+    let from = 0;
+    while (from < text.length) {
+      const markerIdx = text.indexOf(codexAppServerClientCaptureMarker, from);
+      if (markerIdx < 0) return null;
+      const anchorIdx = text.lastIndexOf(codexAppServerClientCaptureAnchor, markerIdx);
+      if (anchorIdx >= 0 && markerIdx - anchorIdx <= anchorWindow) {
+        const braceIdx = text.indexOf("{", anchorIdx);
+        if (braceIdx >= 0 && braceIdx < markerIdx) {
+          let lineNumber = 0;
+          let lastNewline = -1;
+          for (let i = 0; i < braceIdx; i++) {
+            if (text.charCodeAt(i) === 10) {
+              lineNumber += 1;
+              lastNewline = i;
+            }
+          }
+          return { lineNumber, columnNumber: braceIdx - lastNewline - 1 };
+        }
       }
+      from = markerIdx + codexAppServerClientCaptureMarker.length;
     }
-    return { lineNumber, columnNumber: braceIdx - lastNewline - 1 };
+    return null;
+  }
+
+  function codexAppServerClientClassMatches(ctor) {
+    if (typeof ctor !== "function" || typeof ctor.prototype?.sendRequest !== "function") return false;
+    let source = "";
+    let method = "";
+    try { source = Function.prototype.toString.call(ctor); } catch { source = ""; }
+    try { method = Function.prototype.toString.call(ctor.prototype.sendRequest); } catch { method = ""; }
+    if (source.includes(codexAppServerClientCaptureMarker) || method.includes(codexAppServerClientCaptureMarker)) return true;
+    return method.includes("enqueueRequest") && method.includes("dispatchMessage");
+  }
+
+  // 入口脚本用相对路径 import 出数字哈希分块。只收集 ./ 相对路径，不展开整张 chunk map。
+  function codexRspackRelativeAssetUrls(source, baseUrl) {
+    if (typeof source !== "string" || typeof baseUrl !== "string" || !baseUrl) return [];
+    const found = [];
+    const seen = new Set();
+    const push = (spec) => {
+      if (typeof spec !== "string" || !spec.startsWith("./")) return;
+      if (spec.includes("..") || spec.includes("\\") || spec.includes("//")) return;
+      let href = "";
+      try { href = new URL(spec, baseUrl).href; } catch { return; }
+      const path = href.split("?")[0];
+      if (!path.includes("/assets/") || !path.endsWith(".js") || seen.has(href)) return;
+      seen.add(href);
+      found.push(href);
+    };
+    const registration = source.match(/import\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s+from\s*["'](\.\/[^"']+\.js)["']\s*;?\s*[A-Za-z_$][\w$]*\.C\(\s*\1\s*\)/);
+    if (registration) push(registration[2]);
+    const re = /["'](\.\/[^"'\\\s]+\.js)["']/g;
+    let item;
+    while ((item = re.exec(source))) push(item[1]);
+    return found;
   }
 
   // issue #2399：抓取目标不能再按 asset 文件名前缀写死。Codex 26.930 把
@@ -1171,10 +1214,21 @@
   // 排序只做「可能的更靠前」的启发式，不影响正确性；命中全靠文本匹配。
   const codexAppServerClientBundleHints = ["app-shared-", "app-initial-", "app-main-", "chatg"];
   const codexAppServerClientAssetFetchLimit = 24;
+  const codexAppServerClientGraphFetchLimit = 8;
 
   // 已经拉过全文、确认不含类定义的资产。重试时只看新出现的候选，
   // 不会因为多试几轮就把同一批大文件反复 fetch（#1960 / #2330 的教训）。
   const codexAppServerClientCheckedUrls = new Set();
+  const codexAppServerClientGraphUrls = [];
+  let codexAppServerClientGraphFetches = 0;
+
+  function codexRememberRspackAssetUrls(urls) {
+    for (const url of urls) {
+      if (codexAppServerClientGraphUrls.length >= codexAppServerClientGraphFetchLimit) return;
+      if (!url || codexAppServerClientGraphUrls.includes(url)) continue;
+      codexAppServerClientGraphUrls.push(url);
+    }
+  }
 
   function codexAppServerClientAssetCandidateUrls() {
     const urls = codexAppAssetCandidateUrls().filter((url) => !codexAppServerClientCheckedUrls.has(url));
@@ -1191,28 +1245,50 @@
       .slice(0, codexAppServerClientAssetFetchLimit);
   }
 
-  // 返回 { url, location }；找不到返回 null。diagnostics 由调用方按命中/未命中归类。
+  // 返回 { urls, hit }。urls 是这一轮实际检查的地址；全部已检查过时 urls 为空。
   async function locateCodexAppServerClientInAssets() {
-    const urls = codexAppServerClientAssetCandidateUrls();
-    if (urls.length === 0) return { urls, hit: null };
-    // 先走廉价的 asset loader（有 30s 失败冷却与重试上限），脚本里已经内联了
-    // asset 名时能直接命中，省掉整轮 fetch；不可用就退回到全量文本匹配。
+    const visible = codexAppServerClientAssetCandidateUrls();
     const hinted = resolveCodexAppServerClientHintedUrl();
-    const ordered = hinted && !codexAppServerClientCheckedUrls.has(hinted)
-      ? [hinted, ...urls.filter((url) => url !== hinted)]
-      : urls;
-    for (const url of ordered) {
+    const queue = [];
+    const queued = new Set();
+    const enqueue = (url) => {
+      if (!url || queued.has(url) || codexAppServerClientCheckedUrls.has(url)) return;
+      if (queue.length >= codexAppServerClientAssetFetchLimit) return;
+      queued.add(url);
+      queue.push(url);
+    };
+    if (hinted && !codexAppServerClientCheckedUrls.has(hinted)) enqueue(hinted);
+    for (const url of visible) enqueue(url);
+    for (const url of codexAppServerClientGraphUrls) enqueue(url);
+    if (queue.length === 0) return { urls: [], hit: null };
+    const considered = [];
+    const visibleSet = new Set(visible);
+    if (hinted) visibleSet.add(hinted);
+    while (queue.length && considered.length < codexAppServerClientAssetFetchLimit) {
+      const url = queue.shift();
+      considered.push(url);
       try {
         const text = await fetch(url).then((response) => response.ok ? response.text() : "");
         if (!text) continue;
         const location = locateCodexAppServerClientBreakpoint(text);
-        if (location) return { urls, hit: { url, location } };
+        if (location) {
+          const discovery = !visibleSet.has(url) && codexAppServerClientGraphUrls.includes(url)
+            ? "rspack-import-graph"
+            : "visible-asset";
+          return { urls: considered, hit: { url, location, discovery } };
+        }
         codexAppServerClientCheckedUrls.add(url);
+        if (codexAppServerClientGraphUrls.includes(url)) codexAppServerClientGraphFetches += 1;
+        const room = codexAppServerClientGraphFetchLimit - codexAppServerClientGraphUrls.length;
+        if (room > 0) {
+          codexRememberRspackAssetUrls(codexRspackRelativeAssetUrls(text, url).slice(0, room));
+          for (const next of codexAppServerClientGraphUrls) enqueue(next);
+        }
       } catch {
         // 单个 asset 拉取失败不影响其余候选，继续下一个；没记成已检查，下一轮还会再试。
       }
     }
-    return { urls, hit: null };
+    return { urls: considered, hit: null };
   }
 
   // 兼容旧路径：asset 名确实内联在入口脚本里时，用 loader 的缓存直接拿到 URL，
@@ -1231,13 +1307,53 @@
   // 报 anchor_missing 后本页再也不试，launcher 等不到坐标就放弃捕获，依赖原型补丁的功能全部失效。
   // 所以未命中时按退避重试；总时长控制在 launcher 90s 的坐标等待窗口之内。
   const codexAppServerClientCaptureRetryDelaysMs = [1000, 2000, 4000, 8000, 15000, 15000, 15000];
+  const codexAppServerClientCaptureVias = new Set(["rspack-export", "rspack-shape", "rspack-instance", "app-server-manager"]);
   let codexAppServerClientCaptureStarted = false;
   let codexAppServerClientCaptureAttempts = 0;
+
+  function publishCodexAppServerClientClass(ctor, via) {
+    if (!codexAppServerClientClassMatches(ctor)) return false;
+    window.__codexPlusAppServerClientClass = ctor;
+    sendCodexPlusDiagnostic("app_server_client_class_captured", {
+      via: codexAppServerClientCaptureVias.has(via) ? via : "rspack-export",
+    });
+    if (typeof installCodexAppServerClientPrototypePatch === "function") {
+      try { installCodexAppServerClientPrototypePatch(); } catch {}
+    }
+    return true;
+  }
+
+  // 类已经在 Rspack 模块缓存或 AppServerManager 里时，直接发布构造器。
+  // 这样不依赖断点 URL：Fast 的 import map 会把分块执行切到 blob，按原资产 URL 下的断点打不中。
+  async function publishCodexAppServerClientClassFromRuntime() {
+    const hook = window.__codexPlusRspackCaptureAppServerClientClass;
+    if (typeof hook === "function") {
+      try {
+        const found = await hook();
+        if (publishCodexAppServerClientClass(found?.ctor, found?.via || "rspack-export")) return true;
+      } catch {}
+    }
+    if (typeof codexPlusAppServerClient === "function") {
+      try {
+        const client = await codexPlusAppServerClient("local");
+        if (publishCodexAppServerClientClass(client?.constructor, "app-server-manager")) return true;
+      } catch {}
+    }
+    return false;
+  }
+
   async function installCodexAppServerClientCapture() {
-    if (codexAppServerClientCaptureStarted || window.__codexPlusAppServerClientCapture) return;
+    if (window.__codexPlusAppServerClientClass || window.__codexPlusAppServerClientCapture) {
+      if (typeof installCodexAppServerClientPrototypePatch === "function") {
+        try { installCodexAppServerClientPrototypePatch(); } catch {}
+      }
+      return;
+    }
+    if (codexAppServerClientCaptureStarted) return;
     codexAppServerClientCaptureStarted = true;
     codexAppServerClientCaptureAttempts += 1;
     try {
+      if (await publishCodexAppServerClientClassFromRuntime()) return;
       if (typeof fetch !== "function") return;
       const { urls, hit } = await locateCodexAppServerClientInAssets();
       if (!hit) {
@@ -1256,6 +1372,7 @@
           candidateCount: urls.length,
           checkedCount: codexAppServerClientCheckedUrls.size,
           attempts: codexAppServerClientCaptureAttempts,
+          graphFetchCount: codexAppServerClientGraphFetches,
         });
         return;
       }
@@ -1266,6 +1383,8 @@
         columnNumber: hit.location.columnNumber,
         asset: (hit.url.split("/").pop() || "").split("?")[0],
         attempts: codexAppServerClientCaptureAttempts,
+        discovery: hit.discovery || "visible-asset",
+        graphFetchCount: codexAppServerClientGraphFetches,
       });
     } catch (error) {
       codexAppServerClientCaptureStarted = false;
@@ -1450,8 +1569,22 @@
       try {
         const { modules, candidates, sources, discovery } = await loadAppServerRequestCandidates();
         if (modules.length === 0) {
+          // 原型补丁已经套上 sendRequest 时，模型列表走的就是这条路径。
+          // 没有可枚举的实例也不该再报 assets_missing。
+          if (window.__codexPlusAppServerClientPrototypePatchInstalled === codexAppServerModelRequestPatchVersion) {
+            window.__codexPlusAppServerModelRequestPatchInstalled = codexAppServerModelRequestPatchVersion;
+            sendCodexPlusDiagnostic("model_app_server_request_patch_installed", {
+              moduleCount: 0,
+              candidateCount: 0,
+              patchedCount: 0,
+              sources: ["rspack-prototype"],
+              discovery: "rspack-prototype",
+            });
+            return;
+          }
           noteAppServerModelRequestPatchMiss("model_app_server_request_patch_skipped", {
             reason: "app_server_request_assets_missing",
+            ...(typeof codexRspackModuleCount === "function" && codexRspackModuleCount() > 0 ? { rspack: true } : {}),
           });
           return;
         }

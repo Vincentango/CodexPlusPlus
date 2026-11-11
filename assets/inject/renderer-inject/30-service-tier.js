@@ -903,6 +903,8 @@
   let serviceTierDispatcherPatchMissCount = 0;
   let serviceTierDispatcherPatchDisabled = false;
   let serviceTierDispatcherPatchPromise = null;
+  let serviceTierDispatcherPatchRspackSize = -1;
+  let serviceTierDispatcherPatchPendingSkips = 0;
 
   function codexServiceTierDispatcherPatchable(dispatcher) {
     if (!dispatcher || typeof dispatcher !== "object") return false;
@@ -933,21 +935,36 @@
       const errors = [];
       // 26.1016 起 dispatcher 类定义并导出在 app-shared-*，app-initial-* 只导入不再导出，
       // setting-storage-* / vscode-api-* 也已不存在；缺这个前缀整层请求改写都装不上（#2657）。
+      let pending = false;
       for (const assetPrefix of ["setting-storage-", "vscode-api-", "app-initial-", "app-shared-"]) {
         try {
           const module = await loadCodexAppModule(assetPrefix);
           const dispatcher = codexServiceTierDispatcherFromModule(module);
-          if (dispatcher) return { dispatcher, assetPrefix };
+          if (dispatcher) {
+            return {
+              dispatcher,
+              assetPrefix,
+              discovery: module?.__codexPlusAssetDiscovery || "",
+            };
+          }
+          if (module?.__codexPlusAssetDiscovery === "rspack-module-cache") {
+            pending = true;
+            errors.push(`${assetPrefix}: rspack pending`);
+            continue;
+          }
           errors.push(`${assetPrefix}: dispatcher export unavailable`);
         } catch (error) {
+          if (error?.code === "CODEX_PLUS_RSPACK_PENDING") pending = true;
           errors.push(`${assetPrefix}: ${error?.message || String(error)}`);
         }
       }
-      throw new Error(`Codex dispatcher unavailable (${errors.join("; ")})`);
+      const unavailable = new Error(`Codex dispatcher unavailable (${errors.join("; ")})`);
+      if (pending) unavailable.code = "CODEX_PLUS_RSPACK_PENDING";
+      throw unavailable;
     };
     const patch = async () => {
       try {
-        const { dispatcher, assetPrefix } = await loadDispatcher();
+        const { dispatcher, assetPrefix, discovery } = await loadDispatcher();
         if (!codexServiceTierDispatcherPatchable(dispatcher)) {
           throw new Error(`dispatcher is a non-writable RPC stub (${assetPrefix})`);
         }
@@ -960,8 +977,19 @@
         installCodexRemoteSessionDispatcherSubscription(dispatcher, assetPrefix);
         window.__codexServiceTierRequestOverrideInstalled = codexServiceTierRequestOverrideVersion;
         serviceTierDispatcherPatchMissCount = 0;
-        sendCodexPlusDiagnostic("service_tier_dispatcher_patch_installed", { assetPrefix });
+        const detail = { assetPrefix };
+        if (discovery) detail.discovery = discovery;
+        sendCodexPlusDiagnostic("service_tier_dispatcher_patch_installed", detail);
       } catch (error) {
+        if (error?.code === "CODEX_PLUS_RSPACK_PENDING") {
+          const size = typeof codexRspackModuleCount === "function" ? codexRspackModuleCount() : 0;
+          const growing = size > 0 && size !== serviceTierDispatcherPatchRspackSize;
+          if ((growing || serviceTierDispatcherPatchPendingSkips < 8) && serviceTierDispatcherPatchPendingSkips < 40) {
+            serviceTierDispatcherPatchRspackSize = size;
+            serviceTierDispatcherPatchPendingSkips += 1;
+            return;
+          }
+        }
         serviceTierDispatcherPatchMissCount += 1;
         if (serviceTierDispatcherPatchMissCount === 1) {
           sendCodexPlusDiagnostic("service_tier_dispatcher_patch_failed", {

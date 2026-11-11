@@ -730,6 +730,10 @@ describe("rspack hashed asset semantic discovery", () => {
     const lazy = "app://-/assets/300.dddddddd.js";
     let executed = false;
     class Client {
+      dispatchMessage: unknown = null;
+      enqueueRequest() {
+        return null;
+      }
       sendRequest() {
         if (this.dispatchMessage == null) throw new Error("AppServerRequestClient is missing a message dispatcher");
         return this.enqueueRequest();
@@ -775,7 +779,9 @@ describe("rspack hashed asset semantic discovery", () => {
     assert.equal(typeof (shared?.dispatcher as { dispatchMessage?: unknown })?.dispatchMessage, "function");
     assert.equal(shared?.hostServices, host);
     assert.equal(String(shared?.qut).includes("get-global-state"), true);
-    const settings = settingFromModule(await api.codexRspackSemanticNamespace("setting-storage-"), "setting-storage-");
+    const settingModule = await api.codexRspackSemanticNamespace("setting-storage-");
+    assert.ok(settingModule);
+    const settings = settingFromModule(settingModule, "setting-storage-");
     assert.equal(settings?.n, getSetting);
     assert.equal(settings?.s, setSetting);
     const requestModule = await api.loadRspackAppServerRequestModule();
@@ -786,7 +792,7 @@ describe("rspack hashed asset semantic discovery", () => {
     assert.equal(captured?.via, "rspack-export");
     assert.equal(executed, false);
     assert.deepEqual(imported, [chunk, entry]);
-    assert.ok(!imported.includes(lazy));
+    assert.equal((imported as string[]).indexOf(lazy), -1);
   });
 
   it("keeps the named asset import ahead of rspack discovery and does not hardcode chunk hashes", async () => {
